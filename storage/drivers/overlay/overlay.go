@@ -928,7 +928,17 @@ func (d *Driver) pruneStagingDirectories() bool {
 // This API is experimental and can be changed without bumping the major version number.
 // TODO: to remove the comment once it's no longer experimental.
 func (d *Driver) LookupAdditionalLayer(tocDigest digest.Digest, ref string) (graphdriver.AdditionalLayer, error) {
-	l, err := d.getAdditionalLayerPath(tocDigest, ref)
+	return d.LookupAdditionalLayerByCandidates([]graphdriver.AdditionalLayerCandidate{{
+		Key:  tocDigest.String(),
+		Kind: "toc",
+	}}, ref)
+}
+
+// LookupAdditionalLayerByCandidates looks up additional layer store by trying the specified
+// candidate keys in order for the provided image reference.
+// This API is experimental and can be changed without bumping the major version number.
+func (d *Driver) LookupAdditionalLayerByCandidates(candidates []graphdriver.AdditionalLayerCandidate, ref string) (graphdriver.AdditionalLayer, error) {
+	l, err := d.getAdditionalLayerPathByCandidates(candidates, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -2745,7 +2755,9 @@ func validateOneAdditionalLayerPath(target string) error {
 		filepath.Join(target, "info"),
 		filepath.Join(target, "blob"),
 	} {
-		if err := fileutils.Exists(p); err != nil {
+		err := fileutils.Exists(p)
+		logrus.Debugf("additional layer validate path=%q err=%v", p, err)
+		if err != nil {
 			return err
 		}
 	}
@@ -2753,21 +2765,56 @@ func validateOneAdditionalLayerPath(target string) error {
 }
 
 func (d *Driver) getAdditionalLayerPath(tocDigest digest.Digest, ref string) (string, error) {
+	return d.getAdditionalLayerPathByCandidates([]graphdriver.AdditionalLayerCandidate{{
+		Key:  tocDigest.String(),
+		Kind: "toc",
+	}}, ref)
+}
+
+func (d *Driver) getAdditionalLayerPathByKey(key, ref string) (string, error) {
 	refElem := base64.StdEncoding.EncodeToString([]byte(ref))
+	var lastTarget string
+	var lastErr error
 	for _, ls := range d.options.layerStores {
-		ref := ""
+		refPath := ""
 		if ls.withReference {
-			ref = refElem
+			refPath = refElem
 		}
-		target := path.Join(ls.path, ref, tocDigest.String())
+		target := path.Join(ls.path, refPath, key)
+		lastTarget = target
+		logrus.Debugf("additional layer lookup ls.path=%q ls.withReference=%t ref=%q refElem=%q refPath=%q key=%q target=%q", ls.path, ls.withReference, ref, refElem, refPath, key, target)
 		err := validateOneAdditionalLayerPath(target)
 		if err == nil {
 			return target, nil
 		}
-		logrus.Debugf("additional Layer Store %v failed to stat additional layer: %v", ls, err)
+		lastErr = err
+		logrus.Debugf("additional layer store %v failed to stat additional layer key %q target=%q: %v", ls, key, target, err)
 	}
 
-	return "", fmt.Errorf("additional layer (%q, %q) not found: %w", tocDigest, ref, graphdriver.ErrLayerUnknown)
+	if lastErr != nil {
+		return "", fmt.Errorf("additional layer (%q, %q) target=%q failed validation: %v: %w", key, ref, lastTarget, lastErr, graphdriver.ErrLayerUnknown)
+	}
+
+	return "", fmt.Errorf("additional layer (%q, %q) not found: %w", key, ref, graphdriver.ErrLayerUnknown)
+}
+
+func (d *Driver) getAdditionalLayerPathByCandidates(candidates []graphdriver.AdditionalLayerCandidate, ref string) (string, error) {
+	for _, candidate := range candidates {
+		if candidate.Key == "" {
+			continue
+		}
+		target, err := d.getAdditionalLayerPathByKey(candidate.Key, ref)
+		if err == nil {
+			logrus.Debugf("additional layer store matched candidate kind=%q key=%q ref=%q", candidate.Kind, candidate.Key, ref)
+			return target, nil
+		}
+		if !errors.Is(err, graphdriver.ErrLayerUnknown) {
+			return "", err
+		}
+		logrus.Debugf("additional layer store candidate miss kind=%q key=%q ref=%q: %v", candidate.Kind, candidate.Key, ref, err)
+	}
+
+	return "", fmt.Errorf("additional layer candidates for ref %q not found: %w", ref, graphdriver.ErrLayerUnknown)
 }
 
 func (d *Driver) releaseAdditionalLayerByID(id string) {

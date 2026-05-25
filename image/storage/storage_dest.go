@@ -524,6 +524,37 @@ func (s *storageImageDestination) TryReusingBlobWithOptions(ctx context.Context,
 	})
 }
 
+func appendAdditionalLayerDigestCandidates(candidates []storage.AdditionalLayerCandidate, seen map[string]struct{}, d digest.Digest, prefixedKind, bareKind string) []storage.AdditionalLayerCandidate {
+	if d == "" {
+		return candidates
+	}
+	if err := d.Validate(); err != nil {
+		return candidates
+	}
+	for _, candidate := range []storage.AdditionalLayerCandidate{
+		{Key: d.String(), Kind: prefixedKind},
+		{Key: d.Encoded(), Kind: bareKind},
+	} {
+		if _, ok := seen[candidate.Key]; ok {
+			continue
+		}
+		seen[candidate.Key] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func additionalLayerCandidates(tocDigest digest.Digest, useTOCDigest bool, compressedDigest, uncompressedDigest digest.Digest) []storage.AdditionalLayerCandidate {
+	seen := map[string]struct{}{}
+	candidates := make([]storage.AdditionalLayerCandidate, 0, 6)
+	if useTOCDigest && tocDigest != "" {
+		candidates = appendAdditionalLayerDigestCandidates(candidates, seen, tocDigest, "toc", "bare-toc")
+	}
+	candidates = appendAdditionalLayerDigestCandidates(candidates, seen, compressedDigest, "compressed-digest", "bare-compressed-digest")
+	candidates = appendAdditionalLayerDigestCandidates(candidates, seen, uncompressedDigest, "diff-digest", "bare-diff-digest")
+	return candidates
+}
+
 // tryReusingBlobAsPending implements TryReusingBlobWithOptions for (blobDigest, size or -1), filling s.blobDiffIDs and other metadata.
 // The caller must arrange the blob to be eventually committed using s.commitLayer().
 func (s *storageImageDestination) tryReusingBlobAsPending(blobDigest digest.Digest, size int64, options *private.TryReusingBlobOptions) (bool, private.ReusedBlob, error) {
@@ -534,27 +565,38 @@ func (s *storageImageDestination) tryReusingBlobAsPending(blobDigest digest.Dige
 		return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
 	}
 	useTOCDigest := false // If set, (options.TOCDigest != "" && options.LayerIndex != nil) AND we can use options.TOCDigest safely.
-	if options.TOCDigest != "" && options.LayerIndex != nil {
-		if err := options.TOCDigest.Validate(); err != nil {
-			return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
-		}
-		// Only consider using TOCDigest if we can avoid ambiguous image “views”, see the detailed comment in PutBlobPartial.
-		_, err := s.untrustedLayerDiffID(*options.LayerIndex)
+	var untrustedLayerDiffID digest.Digest
+
+	if options.LayerIndex != nil {
+		d, err := s.untrustedLayerDiffID(*options.LayerIndex)
 		if err != nil {
 			var diffIDUnknownErr untrustedLayerDiffIDUnknownError
 			switch {
 			case errors.Is(err, errUntrustedLayerDiffIDNotYetAvailable):
-				// options.TOCDigest is a private API, so all callers are within c/image, and should have called
-				// NoteOriginalOCIConfig first.
-				return false, private.ReusedBlob{}, fmt.Errorf("internal error: in TryReusingBlobWithOptions, untrustedLayerDiffID returned errUntrustedLayerDiffIDNotYetAvailable")
+				if options.TOCDigest != "" {
+					// options.TOCDigest is a private API, so all callers are within c/image, and should have called
+					// NoteOriginalOCIConfig first.
+					return false, private.ReusedBlob{}, fmt.Errorf("internal error: in TryReusingBlobWithOptions, untrustedLayerDiffID returned errUntrustedLayerDiffIDNotYetAvailable")
+				}
+				logrus.Debugf("Not using DiffID to look for layer reuse: %v", err)
 			case errors.As(err, &diffIDUnknownErr):
-				logrus.Debugf("Not using TOC %q to look for layer reuse: %v", options.TOCDigest, err)
-				// But don’t abort entirely, keep useTOCDigest = false, try a blobDigest match.
+				if options.TOCDigest != "" {
+					logrus.Debugf("Not using TOC %q to look for layer reuse: %v", options.TOCDigest, err)
+					// But don’t abort entirely, keep useTOCDigest = false, try digest-based matches.
+				}
 			default:
 				return false, private.ReusedBlob{}, err
 			}
 		} else {
-			useTOCDigest = true
+			untrustedLayerDiffID = d
+			if options.TOCDigest != "" {
+				useTOCDigest = true
+			}
+		}
+	}
+	if options.TOCDigest != "" {
+		if err := options.TOCDigest.Validate(); err != nil {
+			return false, private.ReusedBlob{}, fmt.Errorf("Can not check for a blob with invalid digest: %w", err)
 		}
 	}
 
@@ -562,30 +604,34 @@ func (s *storageImageDestination) tryReusingBlobAsPending(blobDigest digest.Dige
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	if options.SrcRef != nil && useTOCDigest {
-		// Check if we have the layer in the underlying additional layer store.
-		aLayer, err := s.imageRef.transport.store.LookupAdditionalLayer(options.TOCDigest, options.SrcRef.String())
-		if err != nil && !errors.Is(err, storage.ErrLayerUnknown) {
-			return false, private.ReusedBlob{}, fmt.Errorf(`looking for compressed layers with digest %q and labels: %w`, blobDigest, err)
-		} else if err == nil {
-			// Compare the long comment in PutBlobPartial. We assume that the Additional Layer Store will, somehow,
-			// avoid layer “view” ambiguity.
-			alsTOCDigest := aLayer.TOCDigest()
-			if alsTOCDigest != options.TOCDigest {
-				// FIXME: If alsTOCDigest is "", the Additional Layer Store FUSE server is probably just too old, and we could
-				// probably go on reading the layer from other sources.
-				//
-				// Currently it should not be possible for alsTOCDigest to be set and not the expected value, but there’s
-				// not that much benefit to checking for equality — we trust the FUSE server to validate the digest either way.
-				return false, private.ReusedBlob{}, fmt.Errorf("additional layer for TOCDigest %q reports unexpected TOCDigest %q",
-					options.TOCDigest, alsTOCDigest)
+	if options.SrcRef != nil && options.LayerIndex != nil {
+		candidates := additionalLayerCandidates(options.TOCDigest, useTOCDigest, blobDigest, untrustedLayerDiffID)
+		if len(candidates) > 0 {
+			// Check if we have the layer in the underlying additional layer store.
+			aLayer, err := s.imageRef.transport.store.LookupAdditionalLayerByCandidates(candidates, options.SrcRef.String())
+			if err != nil && !errors.Is(err, storage.ErrLayerUnknown) {
+				return false, private.ReusedBlob{}, fmt.Errorf(`looking for compressed layers with digest %q and labels: %w`, blobDigest, err)
+			} else if err == nil {
+				// Compare the long comment in PutBlobPartial. We assume that the Additional Layer Store will, somehow,
+				// avoid layer “view” ambiguity.
+				alsTOCDigest := aLayer.TOCDigest()
+				if useTOCDigest && alsTOCDigest != "" && alsTOCDigest != options.TOCDigest {
+					return false, private.ReusedBlob{}, fmt.Errorf("additional layer for TOCDigest %q reports unexpected TOCDigest %q",
+						options.TOCDigest, alsTOCDigest)
+				}
+				if useTOCDigest {
+					s.lockProtected.indexToTOCDigest[*options.LayerIndex] = options.TOCDigest
+				}
+				if untrustedLayerDiffID != "" {
+					s.lockProtected.indexToDiffID[*options.LayerIndex] = untrustedLayerDiffID
+					s.lockProtected.blobDiffIDs[blobDigest] = untrustedLayerDiffID
+				}
+				s.lockProtected.indexToAdditionalLayer[*options.LayerIndex] = aLayer
+				return true, private.ReusedBlob{
+					Digest: blobDigest,
+					Size:   aLayer.CompressedSize(),
+				}, nil
 			}
-			s.lockProtected.indexToTOCDigest[*options.LayerIndex] = options.TOCDigest
-			s.lockProtected.indexToAdditionalLayer[*options.LayerIndex] = aLayer
-			return true, private.ReusedBlob{
-				Digest: blobDigest,
-				Size:   aLayer.CompressedSize(),
-			}, nil
 		}
 	}
 

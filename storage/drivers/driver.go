@@ -380,17 +380,28 @@ type AdditionalLayer interface {
 	Release()
 }
 
+// AdditionalLayerCandidate describes one bootstrap lookup key for an additional layer.
+// This API is experimental and can be changed without bumping the major version number.
+type AdditionalLayerCandidate struct {
+	Key  string
+	Kind string
+}
+
 // AdditionalLayerStoreDriver is the interface for driver that supports
 // additional layer store functionality.
 // This API is experimental and can be changed without bumping the major version number.
 type AdditionalLayerStoreDriver interface {
 	Driver
 
-	// LookupAdditionalLayer looks up additional layer store by the specified
-	// TOC digest and ref and returns an object representing that layer.
+	// LookupAdditionalLayer looks up an additional layer store entry using the
+	// TOC digest for the provided image reference.
 	LookupAdditionalLayer(tocDigest digest.Digest, ref string) (AdditionalLayer, error)
 
-	// LookupAdditionalLayer looks up additional layer store by the specified
+	// LookupAdditionalLayerByCandidates looks up an additional layer store entry by
+	// trying the specified candidate keys in order for the provided image reference.
+	LookupAdditionalLayerByCandidates(candidates []AdditionalLayerCandidate, ref string) (AdditionalLayer, error)
+
+	// LookupAdditionalLayerByID looks up additional layer store by the specified
 	// ID and returns an object representing that layer.
 	LookupAdditionalLayerByID(id string) (AdditionalLayer, error)
 }

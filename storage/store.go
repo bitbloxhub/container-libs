@@ -580,15 +580,20 @@ type Store interface {
 	// GetDigestLock returns digest-specific Locker.
 	GetDigestLock(digest.Digest) (Locker, error)
 
-	// LayerFromAdditionalLayerStore searches the additional layer store and returns an object
-	// which can create a layer with the specified TOC digest associated with the specified image
-	// reference. Note that this hasn't been stored to this store yet: the actual creation of
-	// a usable layer is done by calling the returned object's PutAs() method.  After creating
+	// LookupAdditionalLayer searches the additional layer store and returns an object
+	// which can create a layer using the specified TOC digest and image reference.
+	// Note that this hasn't been stored to this store yet: the actual creation of
+	// a usable layer is done by calling the returned object's PutAs() method. After creating
 	// a layer, the caller must then call the object's Release() method to free any temporary
 	// resources which were allocated for the object by this method or the object's PutAs()
 	// method.
 	// This API is experimental and can be changed without bumping the major version number.
 	LookupAdditionalLayer(tocDigest digest.Digest, imageref string) (AdditionalLayer, error)
+
+	// LookupAdditionalLayerByCandidates searches the additional layer store and returns an object
+	// which can create a layer using the first matching candidate key associated with the
+	// specified image reference.
+	LookupAdditionalLayerByCandidates(candidates []AdditionalLayerCandidate, imageref string) (AdditionalLayer, error)
 
 	// Tries to clean up remainders of previous containers or layers that are not
 	// references in the json files. These can happen in the case of unclean
@@ -628,6 +633,8 @@ type AdditionalLayer interface {
 	// Release tells the additional layer store that we don't use this handler.
 	Release()
 }
+
+type AdditionalLayerCandidate = drivers.AdditionalLayerCandidate
 
 type AutoUserNsOptions = types.AutoUserNsOptions
 
@@ -3478,6 +3485,13 @@ func (s *store) Layer(id string) (*Layer, error) {
 }
 
 func (s *store) LookupAdditionalLayer(tocDigest digest.Digest, imageref string) (AdditionalLayer, error) {
+	return s.LookupAdditionalLayerByCandidates([]drivers.AdditionalLayerCandidate{{
+		Key:  tocDigest.String(),
+		Kind: "toc",
+	}}, imageref)
+}
+
+func (s *store) LookupAdditionalLayerByCandidates(candidates []AdditionalLayerCandidate, imageref string) (AdditionalLayer, error) {
 	var adriver drivers.AdditionalLayerStoreDriver
 	if err := func() error { // A scope for defer
 		if err := s.startUsingGraphDriver(); err != nil {
@@ -3494,7 +3508,7 @@ func (s *store) LookupAdditionalLayer(tocDigest digest.Digest, imageref string) 
 		return nil, err
 	}
 
-	al, err := adriver.LookupAdditionalLayer(tocDigest, imageref)
+	al, err := adriver.LookupAdditionalLayerByCandidates(candidates, imageref)
 	if err != nil {
 		if errors.Is(err, drivers.ErrLayerUnknown) {
 			return nil, ErrLayerUnknown

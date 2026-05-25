@@ -1448,6 +1448,7 @@ func (r *layerStore) PutAdditionalLayer(id string, parentLayer *Layer, names []s
 	layer.ID = id
 	layer.Parent = parent
 	layer.Created = time.Now().UTC()
+	layer.location = r.pickStoreLocation(false, false)
 
 	if err := aLayer.CreateAs(id, parent); err != nil {
 		return nil, err
